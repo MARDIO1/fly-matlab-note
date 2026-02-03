@@ -39,3 +39,4 @@ legend('Rudder FR (Raw)', 'Rudder FL (Raw)'); title('原始舵机数据');
 subplot(2,1,2);
 plot(data_subset.surface_FR); hold on; plot(data_subset.surface_FL);
 legend('Surface FR (Mapped)', 'Surface FL (Mapped)'); title('逆映射后的翼面角度');
+
