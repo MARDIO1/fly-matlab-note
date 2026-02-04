@@ -1,5 +1,5 @@
 %% =====================================================================
-%  X型翼飞行器 - 物理约束雅可比矩阵拟合
+%  X型翼飞行器 - 物理约束雅可比矩阵拟合 + PID调参分析
 %  舵面顺序: [FR, FL, BL, BR] (前右, 前左, 后左, 后右)
 %% =====================================================================
 
@@ -17,429 +17,493 @@ if ischar(files)
 end
 
 nFiles = length(files);
-fprintf('===== X型翼雅可比矩阵拟合 =====\n');
+fprintf('===== X型翼雅可比矩阵拟合 + PID分析 =====\n');
 fprintf('已选择 %d 个文件\n\n', nFiles);
 
-%% 2. 列名配置 (根据您的C代码)
-% 输入: 舵面角度 [FR, FL, BL, BR]
-inputCols = {'surface_d_FR', 'surface_d_FL', 'surface_d_BL', 'surface_d_BR'};
-% 备选列名格式
-inputCols_alt = {'surface_d[0]', 'surface_d[1]', 'surface_d[2]', 'surface_d[3]'};
+%% 2. 列名配置 (根据您的数据格式)
+% 舵面列名
+rudderCols = {'rudder1', 'rudder2', 'rudder3', 'rudder4'};  % FR, FL, BL, BR
 
-% 输出: 机体角度/角速度 [Roll, Pitch, Yaw]
-outputCols_angle = {'angle_d_Roll', 'angle_d_Pitch', 'angle_d_Yaw'};
-outputCols_gyro = {'gyro_radps_Roll', 'gyro_radps_Pitch', 'gyro_radps_Yaw'};
-outputCols_alt = {'angle_d[0]', 'angle_d[1]', 'angle_d[2]'};
+% 姿态角度列名 (度)
+angleCols = {'angle_roll', 'angle_pitch', 'angle_yaw'};
+
+% 角速度列名 (rad/s)
+gyroCols = {'gyro_x', 'gyro_y', 'gyro_z'};
+
+% 加速度列名
+accCols = {'acc_x', 'acc_y', 'acc_z'};
 
 %% 3. 合并所有文件数据
-X_all = [];  % 舵面输入 [FR, FL, BL, BR]
-Y_angle = [];  % 角度输出
-Y_gyro = [];   % 角速度输出
+allData = [];
 
-for f = 1:nFiles
-    filepath = fullfile(path, files{f});
-    data = readtable(filepath, 'VariableNamingRule', 'preserve');
-    
-    fprintf('文件%d: %s (%d行)\n', f, files{f}, height(data));
-    
-    % 显示列名帮助调试
-    if f == 1
-        fprintf('  检测到的列名: ');
-        disp(data.Properties.VariableNames);
+for i = 1:nFiles
+    filePath = fullfile(path, files{i});
+    try
+        T = readtable(filePath);
+        fprintf('文件 %d: %s (%d行)\n', i, files{i}, height(T));
+        allData = [allData; T];
+    catch ME
+        fprintf('文件 %d 读取失败: %s\n', i, ME.message);
     end
-    
-    % 尝试提取输入数据
-    X = zeros(height(data), 4);
-    colNames = data.Properties.VariableNames;
-    
-    % 智能匹配列名
-    for i = 1:4
-        matched = false;
-        % 尝试多种可能的列名
-        possibleNames = {inputCols{i}, inputCols_alt{i}, ...
-            sprintf('surface_d_%d', i-1), sprintf('surface_d(%d)', i-1)};
-        
-        for pn = possibleNames
-            idx = find(contains(colNames, pn{1}, 'IgnoreCase', true), 1);
-            if ~isempty(idx)
-                X(:, i) = data{:, idx};
-                matched = true;
-                break;
-            end
-        end
-        
-        if ~matched
-            % 按位置提取（假设surface_d连续存储）
-            surfaceIdx = find(contains(colNames, 'surface', 'IgnoreCase', true));
-            if length(surfaceIdx) >= 4
-                X(:, i) = data{:, surfaceIdx(i)};
-            end
-        end
-    end
-    
-    % 提取输出数据 - 角度
-    Y_ang = zeros(height(data), 3);
-    Y_gyr = zeros(height(data), 3);
-    
-    angleIdx = find(contains(colNames, 'angle_d', 'IgnoreCase', true));
-    gyroIdx = find(contains(colNames, 'gyro', 'IgnoreCase', true));
-    
-    if length(angleIdx) >= 3
-        for i = 1:3
-            Y_ang(:, i) = data{:, angleIdx(i)};
-        end
-    end
-    
-    if length(gyroIdx) >= 3
-        for i = 1:3
-            Y_gyr(:, i) = data{:, gyroIdx(i)};
-        end
-    end
-    
-    % 清洗数据
-    validIdx = all(isfinite(X), 2) & all(isfinite(Y_ang), 2);
-    
-    X_all = [X_all; X(validIdx, :)];
-    Y_angle = [Y_angle; Y_ang(validIdx, :)];
-    Y_gyro = [Y_gyro; Y_gyr(validIdx, :)];
 end
 
-fprintf('\n总数据点: %d\n', size(X_all, 1));
+fprintf('\n合并后总数据: %d 行\n\n', height(allData));
 
-%% 4. 数据预处理
-% 去均值（工作点线性化）
-X_mean = mean(X_all);
-Y_angle_mean = mean(Y_angle);
-Y_gyro_mean = mean(Y_gyro);
+%% 4. 提取数据
+% 时间
+time_ms = allData.packet_timestamp;
+time_s = (time_ms - time_ms(1)) / 1000;
+dt = median(diff(time_s));
+Fs = 1/dt;
+fprintf('采样频率: %.1f Hz\n', Fs);
 
-dX = X_all - X_mean;
-dY_angle = Y_angle - Y_angle_mean;
-dY_gyro = Y_gyro - Y_gyro_mean;
+% 舵面 [FR, FL, BL, BR]
+delta_FR = allData.rudder1;
+delta_FL = allData.rudder2;
+delta_BL = allData.rudder3;
+delta_BR = allData.rudder4;
 
-fprintf('\n舵面工作点 [FR, FL, BL, BR]: [%.2f, %.2f, %.2f, %.2f] deg\n', X_mean);
-fprintf('角度工作点 [R, P, Y]: [%.2f, %.2f, %.2f] deg\n', Y_angle_mean);
+% 姿态角度 (度)
+angle_roll  = allData.angle_roll;
+angle_pitch = allData.angle_pitch;
+angle_yaw   = allData.angle_yaw;
 
-%% 5. 检查数据范围和激励
-fprintf('\n--- 数据范围检查 ---\n');
-fprintf('舵面变化范围:\n');
-for i = 1:4
-    names = {'FR', 'FL', 'BL', 'BR'};
-    fprintf('  %s: [%.2f, %.2f], std=%.2f deg\n', names{i}, ...
-        min(dX(:,i)), max(dX(:,i)), std(dX(:,i)));
-end
+% 角速度 (rad/s -> deg/s)
+gyro_roll  = rad2deg(allData.gyro_x);
+gyro_pitch = rad2deg(allData.gyro_y);
+gyro_yaw   = rad2deg(allData.gyro_z);
 
-fprintf('角度变化范围:\n');
-names = {'Roll', 'Pitch', 'Yaw'};
-for i = 1:3
-    fprintf('  %s: [%.2f, %.2f], std=%.2f deg\n', names{i}, ...
-        min(dY_angle(:,i)), max(dY_angle(:,i)), std(dY_angle(:,i)));
-end
+% 加速度
+acc_x = allData.acc_x;
+acc_y = allData.acc_y;
+acc_z = allData.acc_z;
 
-%% 6. 方法A: 无约束最小二乘拟合
-fprintf('\n===== 方法A: 无约束拟合 =====\n');
+% 状态机
+state = allData.statemachine;
 
-lambda = 1e-6;
-JT_unconstrained = (dX' * dX + lambda * eye(4)) \ (dX' * dY_angle);
-J_unconstrained = JT_unconstrained';
+%% 5. 数据清洗与分段
+% 找出AUTO模式数据 (state高4位 = 3)
+auto_mask = bitshift(state, -4) == 3;
+fprintf('AUTO模式数据点: %d (%.1f%%)\n', sum(auto_mask), 100*sum(auto_mask)/length(state));
 
-printJacobian(J_unconstrained, '无约束');
-analyzeJacobian(J_unconstrained);
-
-%% 7. 方法B: 物理对称约束拟合 (推荐)
-% 基于X型翼对称性:
-%   Roll:  J(1,FR) ≈ -J(1,FL), J(1,BR) ≈ -J(1,BL)  (左右反对称)
-%   Pitch: J(2,FR) ≈ J(2,FL), J(2,BR) ≈ J(2,BL)   (左右对称)
-%   Yaw:   J(3,FR) ≈ -J(3,FL) ≈ -J(3,BR) ≈ J(3,BL) (对角反对称)
-
-fprintf('\n===== 方法B: 物理约束拟合 =====\n');
-
-% 构建约束矩阵
-% 变量顺序: [a_roll_front, a_roll_back, a_pitch_front, a_pitch_back, a_yaw]
-% 
-% Roll:  J = [+a1, -a1, -a2, +a2]  (FR正, FL负, BL负, BR正)
-% Pitch: J = [+a3, +a3, -a4, -a4]  (前正, 后负)
-% Yaw:   J = [+a5, -a5, +a5, -a5]  (对角同号)
-
-% 设计矩阵映射: 5个独立参数 -> 12个雅可比元素
-% θ = [roll_front, roll_back, pitch_front, pitch_back, yaw]
-
-% Roll行: [+θ1, -θ1, -θ2, +θ2]
-% Pitch行: [+θ3, +θ3, -θ4, -θ4]  
-% Yaw行: [+θ5, -θ5, +θ5, -θ5]
-
-% 构建增广设计矩阵
-n = size(dX, 1);
-A_constrained = zeros(3*n, 5);
-
-for i = 1:n
-    x = dX(i, :);  % [FR, FL, BL, BR]
-    
-    % Roll方程: dy_roll = θ1*(FR-FL) + θ2*(BR-BL)
-    A_constrained(i, 1) = x(1) - x(2);        % θ1: FR-FL
-    A_constrained(i, 2) = x(4) - x(3);        % θ2: BR-BL
-    
-    % Pitch方程: dy_pitch = θ3*(FR+FL) + θ4*(-BR-BL)
-    A_constrained(n+i, 3) = x(1) + x(2);      % θ3: FR+FL
-    A_constrained(n+i, 4) = -(x(3) + x(4));   % θ4: -(BL+BR)
-    
-    % Yaw方程: dy_yaw = θ5*(FR-FL+BL-BR)
-    A_constrained(2*n+i, 5) = x(1) - x(2) + x(3) - x(4);  % θ5: 对角差
-end
-
-b_constrained = [dY_angle(:,1); dY_angle(:,2); dY_angle(:,3)];
-
-% 求解约束参数
-theta = (A_constrained' * A_constrained + 1e-6*eye(5)) \ (A_constrained' * b_constrained);
-
-fprintf('约束参数:\n');
-fprintf('  θ1 (Roll前翼): %.6f\n', theta(1));
-fprintf('  θ2 (Roll后翼): %.6f\n', theta(2));
-fprintf('  θ3 (Pitch前翼): %.6f\n', theta(3));
-fprintf('  θ4 (Pitch后翼): %.6f\n', theta(4));
-fprintf('  θ5 (Yaw): %.6f\n', theta(5));
-
-% 重构雅可比矩阵
-%        FR          FL          BL          BR
-J_constrained = [
-    +theta(1),  -theta(1),  -theta(2),  +theta(2);   % Roll
-    +theta(3),  +theta(3),  -theta(4),  -theta(4);   % Pitch
-    +theta(5),  -theta(5),  +theta(5),  -theta(5)    % Yaw
-];
-
-printJacobian(J_constrained, '物理约束');
-
-%% 8. 计算拟合质量
-fprintf('\n===== 拟合质量对比 =====\n');
-
-% 无约束R²
-Y_pred_unc = dX * J_unconstrained';
-for i = 1:3
-    SS_res = sum((dY_angle(:,i) - Y_pred_unc(:,i)).^2);
-    SS_tot = sum(dY_angle(:,i).^2) + 1e-10;
-    R2_unc(i) = 1 - SS_res / SS_tot;
-end
-
-% 约束R²
-Y_pred_con = dX * J_constrained';
-for i = 1:3
-    SS_res = sum((dY_angle(:,i) - Y_pred_con(:,i)).^2);
-    SS_tot = sum(dY_angle(:,i).^2) + 1e-10;
-    R2_con(i) = 1 - SS_res / SS_tot;
-end
-
-fprintf('           Roll    Pitch    Yaw\n');
-fprintf('无约束 R²: %.4f   %.4f   %.4f\n', R2_unc);
-fprintf('约束后 R²: %.4f   %.4f   %.4f\n', R2_con);
-
-%% 9. 方法C: 使用角速度差分估计（更直接）
-fprintf('\n===== 方法C: 角速度响应拟合 =====\n');
-
-% 角速度对舵面的响应更直接
-if ~isempty(Y_gyro) && any(Y_gyro(:) ~= 0)
-    dY_gyro_clean = Y_gyro - mean(Y_gyro);
-    
-    JT_gyro = (dX' * dX + 1e-6*eye(4)) \ (dX' * dY_gyro_clean);
-    J_gyro = JT_gyro';
-    
-    printJacobian(J_gyro, '角速度响应');
-    
-    % 如果角速度数据好，可能更可靠
-    for i = 1:3
-        Y_pred = dX * JT_gyro(:,i);
-        SS_res = sum((dY_gyro_clean(:,i) - Y_pred).^2);
-        SS_tot = sum(dY_gyro_clean(:,i).^2) + 1e-10;
-        R2_gyro(i) = 1 - SS_res / SS_tot;
-    end
-    fprintf('角速度 R²: %.4f   %.4f   %.4f\n', R2_gyro);
+% 只分析AUTO模式
+if sum(auto_mask) > 100
+    idx = find(auto_mask);
 else
-    fprintf('角速度数据不可用\n');
-    J_gyro = J_constrained;
+    idx = 1:length(time_s);
+    fprintf('警告: AUTO模式数据不足，使用全部数据\n');
 end
 
-%% 10. 选择最佳结果
-fprintf('\n===== 最终推荐 =====\n');
+%% ==================== 第一部分: 雅可比矩阵拟合 ====================
+fprintf('\n===== 雅可比矩阵拟合 =====\n');
 
-% 综合评估
-score_unc = mean(R2_unc);
-score_con = mean(R2_con);
+% 构建输入矩阵 (微分)
+dDelta_FR = [0; diff(delta_FR)];
+dDelta_FL = [0; diff(delta_FL)];
+dDelta_BL = [0; diff(delta_BL)];
+dDelta_BR = [0; diff(delta_BR)];
 
-if score_con > score_unc * 0.95  % 约束模型R²损失<5%则优先选择
-    J_best = J_constrained;
-    method_name = '物理约束';
-else
-    J_best = J_unconstrained;
-    method_name = '无约束';
-end
+% 构建输出矩阵 (角速度变化率)
+dGyro_roll  = [0; diff(gyro_roll)];
+dGyro_pitch = [0; diff(gyro_pitch)];
+dGyro_yaw   = [0; diff(gyro_yaw)];
 
-fprintf('选择: %s 方法\n', method_name);
-printJacobian(J_best, '最终雅可比');
+% 组合输入 (对称约束)
+diff_front = dDelta_FR - dDelta_FL;    % 前翼差动 -> Roll
+diff_back  = dDelta_BR - dDelta_BL;    % 后翼差动 -> Roll
+sum_back   = dDelta_BR + dDelta_BL;    % 后翼同动 -> Pitch
+sum_front  = dDelta_FR + dDelta_FL;    % 前翼同动 -> Pitch (较小)
+diag_diff  = (dDelta_FR + dDelta_BL) - (dDelta_FL + dDelta_BR);  % 对角差 -> Yaw
 
-%% 11. 生成C代码
-fprintf('\n===== C代码输出 =====\n');
+% 有效数据索引 (排除静止)
+valid_idx = abs(dDelta_FR) + abs(dDelta_FL) + abs(dDelta_BL) + abs(dDelta_BR) > 0.1;
+valid_idx = valid_idx & idx';
+fprintf('有效数据点: %d\n', sum(valid_idx));
 
-fprintf('// X型翼雅可比矩阵\n');
-fprintf('// 舵面顺序: [FR, FL, BL, BR]\n');
-fprintf('// 基于 %d 个文件, %d 个数据点\n', nFiles, size(X_all, 1));
-fprintf('// 工作点: 舵面=[%.1f, %.1f, %.1f, %.1f] deg\n', X_mean);
-fprintf('\n');
+%% 物理对称约束拟合
+% Roll = a*(FR-FL) + b*(BR-BL)
+X_roll = [diff_front(valid_idx), diff_back(valid_idx)];
+y_roll = dGyro_roll(valid_idx);
+coef_roll = X_roll \ y_roll;
+pred_roll = X_roll * coef_roll;
+R2_roll = 1 - sum((y_roll - pred_roll).^2) / sum((y_roll - mean(y_roll)).^2);
 
-fprintf('const float Jacobian[3][4] = {\n');
-fprintf('    // FR        FL        BL        BR\n');
-labels = {'Roll ', 'Pitch', 'Yaw  '};
+% Pitch = c*(BR+BL) + d*(FR+FL)
+X_pitch = [sum_back(valid_idx), sum_front(valid_idx)];
+y_pitch = dGyro_pitch(valid_idx);
+coef_pitch = X_pitch \ y_pitch;
+pred_pitch = X_pitch * coef_pitch;
+R2_pitch = 1 - sum((y_pitch - pred_pitch).^2) / sum((y_pitch - mean(y_pitch)).^2);
+
+% Yaw = e*[(FR+BL) - (FL+BR)]
+X_yaw = diag_diff(valid_idx);
+y_yaw = dGyro_yaw(valid_idx);
+coef_yaw = X_yaw \ y_yaw;
+pred_yaw = X_yaw * coef_yaw;
+R2_yaw = 1 - sum((y_yaw - pred_yaw).^2) / sum((y_yaw - mean(y_yaw)).^2);
+
+%% 构建对称雅可比矩阵
+a = coef_roll(1);   % 前翼差动对Roll
+b = coef_roll(2);   % 后翼差动对Roll
+c = coef_pitch(1);  % 后翼同动对Pitch
+d = coef_pitch(2);  % 前翼同动对Pitch
+e = coef_yaw(1);    % 对角差对Yaw
+
+%        [FR,  FL,  BL,  BR]
+J_sym = [+a,  -a,  -b,  +b;    % Roll
+         +d,  +d,  +c,  +c;    % Pitch
+         +e,  -e,  +e,  -e];   % Yaw
+
+fprintf('\n===== 对称约束雅可比矩阵 =====\n');
+fprintf('系数: a=%.4f, b=%.4f, c=%.4f, d=%.4f, e=%.4f\n', a, b, c, d, e);
+fprintf('R²: Roll=%.3f, Pitch=%.3f, Yaw=%.3f\n', R2_roll, R2_pitch, R2_yaw);
+
+fprintf('\n       FR        FL        BL        BR\n');
+labels = {'Roll', 'Pitch', 'Yaw'};
 for i = 1:3
-    fprintf('    {%+.6ff, %+.6ff, %+.6ff, %+.6ff}', J_best(i,:));
-    if i < 3, fprintf(','); end
-    fprintf('  // %s\n', labels{i});
-end
-fprintf('};\n');
-
-% 如果用约束方法，也输出简化参数
-if strcmp(method_name, '物理约束')
-    fprintf('\n// 简化参数（对称模型）\n');
-    fprintf('const float k_roll_front = %.6ff;   // FR-FL对roll的影响\n', theta(1));
-    fprintf('const float k_roll_back  = %.6ff;   // BR-BL对roll的影响\n', theta(2));
-    fprintf('const float k_pitch_front = %.6ff;  // 前翼对pitch的影响\n', theta(3));
-    fprintf('const float k_pitch_back  = %.6ff;  // 后翼对pitch的影响\n', theta(4));
-    fprintf('const float k_yaw = %.6ff;          // 对角差对yaw的影响\n', theta(5));
+    fprintf('%s:  %+.4f   %+.4f   %+.4f   %+.4f\n', labels{i}, J_sym(i,:));
 end
 
-%% 12. 可视化
-figure('Name', 'X型翼雅可比矩阵分析', 'Position', [50 50 1400 800]);
+%% 归一化雅可比矩阵
+J_norm = J_sym ./ max(abs(J_sym), [], 2);
+fprintf('\n===== 归一化雅可比矩阵 =====\n');
+fprintf('       FR        FL        BL        BR\n');
+for i = 1:3
+    fprintf('%s:  %+.4f   %+.4f   %+.4f   %+.4f\n', labels{i}, J_norm(i,:));
+end
 
-% 雅可比热力图
-subplot(2,3,1);
-imagesc(J_best);
+%% ==================== 第二部分: PID响应分析 ====================
+fprintf('\n\n===== PID响应分析 =====\n');
+
+% 您当前的PID参数
+PID_params = struct(...
+    'roll_outer_kp', 6.0, ...
+    'roll_inner_kp', 0.15, 'roll_inner_ki', 0.0, 'roll_inner_kd', 0.008, ...
+    'pitch_outer_kp', 6.0, ...
+    'pitch_inner_kp', 0.15, 'pitch_inner_ki', 0.0, 'pitch_inner_kd', 0.008, ...
+    'yaw_outer_kp', 2.0, ...
+    'yaw_inner_kp', 0.1, 'yaw_inner_ki', 0.0, 'yaw_inner_kd', 0.0);
+
+fprintf('当前PID参数:\n');
+fprintf('Roll:  外环Kp=%.2f, 内环Kp=%.3f Ki=%.3f Kd=%.4f\n', ...
+    PID_params.roll_outer_kp, PID_params.roll_inner_kp, ...
+    PID_params.roll_inner_ki, PID_params.roll_inner_kd);
+fprintf('Pitch: 外环Kp=%.2f, 内环Kp=%.3f Ki=%.3f Kd=%.4f\n', ...
+    PID_params.pitch_outer_kp, PID_params.pitch_inner_kp, ...
+    PID_params.pitch_inner_ki, PID_params.pitch_inner_kd);
+fprintf('Yaw:   外环Kp=%.2f, 内环Kp=%.3f Ki=%.3f Kd=%.4f\n', ...
+    PID_params.yaw_outer_kp, PID_params.yaw_inner_kp, ...
+    PID_params.yaw_inner_ki, PID_params.yaw_inner_kd);
+
+%% 检测阶跃响应段
+min_step_size = 3.0;  % 最小阶跃幅度 (度)
+min_duration = 20;     % 最小持续采样点
+
+% 检测Roll阶跃
+angle_roll_filt = movmean(angle_roll, 5);
+roll_diff = [0; diff(angle_roll_filt)];
+roll_steps = find(abs(roll_diff) > min_step_size / 10);
+
+% 检测Pitch阶跃  
+angle_pitch_filt = movmean(angle_pitch, 5);
+pitch_diff = [0; diff(angle_pitch_filt)];
+pitch_steps = find(abs(pitch_diff) > min_step_size / 10);
+
+fprintf('\n检测到的阶跃点: Roll=%d, Pitch=%d\n', length(roll_steps), length(pitch_steps));
+
+%% 分析阶跃响应特性
+function [rise_time, overshoot, settling_time, steady_error] = analyzeStep(time, signal, step_idx, window)
+    if step_idx + window > length(signal)
+        window = length(signal) - step_idx;
+    end
+    
+    t = time(step_idx:step_idx+window) - time(step_idx);
+    y = signal(step_idx:step_idx+window);
+    
+    y0 = y(1);
+    yf = y(end);
+    dy = yf - y0;
+    
+    if abs(dy) < 1
+        rise_time = NaN; overshoot = NaN; settling_time = NaN; steady_error = NaN;
+        return;
+    end
+    
+    % 上升时间 (10% -> 90%)
+    y10 = y0 + 0.1 * dy;
+    y90 = y0 + 0.9 * dy;
+    idx10 = find(y >= y10, 1);
+    idx90 = find(y >= y90, 1);
+    if isempty(idx10), idx10 = 1; end
+    if isempty(idx90), idx90 = length(t); end
+    rise_time = t(idx90) - t(idx10);
+    
+    % 超调量
+    if dy > 0
+        peak = max(y);
+    else
+        peak = min(y);
+    end
+    overshoot = 100 * abs(peak - yf) / abs(dy);
+    
+    % 调节时间 (5%误差带)
+    error_band = 0.05 * abs(dy);
+    settled = abs(y - yf) < error_band;
+    settled_idx = find(settled, 1, 'first');
+    if isempty(settled_idx)
+        settling_time = t(end);
+    else
+        settling_time = t(settled_idx);
+    end
+    
+    % 稳态误差
+    steady_error = abs(y(end) - yf);
+end
+
+%% 分析多个阶跃响应
+window_size = round(2.0 * Fs);  % 2秒窗口
+
+roll_metrics = [];
+for i = 1:min(10, length(roll_steps))
+    [rt, os, st, se] = analyzeStep(time_s, angle_roll, roll_steps(i), window_size);
+    if ~isnan(rt)
+        roll_metrics = [roll_metrics; rt, os, st, se];
+    end
+end
+
+pitch_metrics = [];
+for i = 1:min(10, length(pitch_steps))
+    [rt, os, st, se] = analyzeStep(time_s, angle_pitch, pitch_steps(i), window_size);
+    if ~isnan(rt)
+        pitch_metrics = [pitch_metrics; rt, os, st, se];
+    end
+end
+
+%% 输出响应分析结果
+fprintf('\n===== 阶跃响应分析 =====\n');
+if ~isempty(roll_metrics)
+    fprintf('Roll轴 (平均值, N=%d):\n', size(roll_metrics,1));
+    fprintf('  上升时间: %.3f s\n', mean(roll_metrics(:,1)));
+    fprintf('  超调量:   %.1f %%\n', mean(roll_metrics(:,2)));
+    fprintf('  调节时间: %.3f s\n', mean(roll_metrics(:,3)));
+else
+    fprintf('Roll轴: 未检测到有效阶跃响应\n');
+end
+
+if ~isempty(pitch_metrics)
+    fprintf('Pitch轴 (平均值, N=%d):\n', size(pitch_metrics,1));
+    fprintf('  上升时间: %.3f s\n', mean(pitch_metrics(:,1)));
+    fprintf('  超调量:   %.1f %%\n', mean(pitch_metrics(:,2)));
+    fprintf('  调节时间: %.3f s\n', mean(pitch_metrics(:,3)));
+else
+    fprintf('Pitch轴: 未检测到有效阶跃响应\n');
+end
+
+%% ==================== 第三部分: 频域分析 ====================
+fprintf('\n===== 频域分析 =====\n');
+
+% 计算角速度频谱
+nfft = 2^nextpow2(length(gyro_roll));
+f = Fs * (0:(nfft/2)) / nfft;
+
+% Roll角速度频谱
+Y_roll = fft(gyro_roll - mean(gyro_roll), nfft);
+P_roll = abs(Y_roll(1:nfft/2+1)) / length(gyro_roll);
+
+% Pitch角速度频谱
+Y_pitch = fft(gyro_pitch - mean(gyro_pitch), nfft);
+P_pitch = abs(Y_pitch(1:nfft/2+1)) / length(gyro_pitch);
+
+% 找主频
+[~, idx_roll] = max(P_roll(2:end)); 
+[~, idx_pitch] = max(P_pitch(2:end));
+fprintf('Roll 主频: %.2f Hz\n', f(idx_roll+1));
+fprintf('Pitch 主频: %.2f Hz\n', f(idx_pitch+1));
+
+%% ==================== 第四部分: 轴间耦合分析 ====================
+fprintf('\n===== 轴间耦合分析 =====\n');
+
+% 计算相关系数
+corr_roll_pitch = corrcoef(gyro_roll, gyro_pitch);
+corr_roll_yaw = corrcoef(gyro_roll, gyro_yaw);
+corr_pitch_yaw = corrcoef(gyro_pitch, gyro_yaw);
+
+fprintf('Roll-Pitch 相关: %.3f\n', corr_roll_pitch(1,2));
+fprintf('Roll-Yaw 相关:   %.3f\n', corr_roll_yaw(1,2));
+fprintf('Pitch-Yaw 相关:  %.3f\n', corr_pitch_yaw(1,2));
+
+coupling_threshold = 0.3;
+if abs(corr_roll_pitch(1,2)) > coupling_threshold
+    fprintf('⚠️  Roll-Pitch耦合较强，考虑解耦控制\n');
+end
+if abs(corr_roll_yaw(1,2)) > coupling_threshold
+    fprintf('⚠️  Roll-Yaw耦合较强，考虑解耦控制\n');
+end
+
+%% ==================== 第五部分: PID调参建议 ====================
+fprintf('\n===== PID调参建议 =====\n');
+
+% 基于响应分析给出建议
+if ~isempty(roll_metrics)
+    avg_rise = mean(roll_metrics(:,1));
+    avg_overshoot = mean(roll_metrics(:,2));
+    
+    fprintf('\nRoll轴:\n');
+    if avg_rise > 0.5
+        fprintf('  → 上升时间偏长(%.2fs)，建议增大外环Kp: %.1f -> %.1f\n', ...
+            avg_rise, PID_params.roll_outer_kp, PID_params.roll_outer_kp * 1.3);
+    elseif avg_rise < 0.15
+        fprintf('  → 响应过快(%.2fs)，可能有震荡风险，建议减小外环Kp\n', avg_rise);
+    else
+        fprintf('  → 上升时间良好(%.2fs)\n', avg_rise);
+    end
+    
+    if avg_overshoot > 25
+        fprintf('  → 超调过大(%.1f%%)，建议增大内环Kd: %.4f -> %.4f\n', ...
+            avg_overshoot, PID_params.roll_inner_kd, PID_params.roll_inner_kd * 1.5);
+    elseif avg_overshoot < 5
+        fprintf('  → 超调良好(%.1f%%)\n', avg_overshoot);
+    end
+end
+
+if ~isempty(pitch_metrics)
+    avg_rise = mean(pitch_metrics(:,1));
+    avg_overshoot = mean(pitch_metrics(:,2));
+    
+    fprintf('\nPitch轴:\n');
+    if avg_rise > 0.5
+        fprintf('  → 上升时间偏长(%.2fs)，建议增大外环Kp: %.1f -> %.1f\n', ...
+            avg_rise, PID_params.pitch_outer_kp, PID_params.pitch_outer_kp * 1.3);
+    else
+        fprintf('  → 上升时间良好(%.2fs)\n', avg_rise);
+    end
+    
+    if avg_overshoot > 25
+        fprintf('  → 超调过大(%.1f%%)，建议增大内环Kd: %.4f -> %.4f\n', ...
+            avg_overshoot, PID_params.pitch_inner_kd, PID_params.pitch_inner_kd * 1.5);
+    end
+end
+
+%% ==================== 可视化 ====================
+%% 图1: 数据总览
+figure('Name', '数据总览', 'Position', [50 50 1400 900]);
+
+subplot(4,1,1);
+plot(time_s, angle_roll, 'r-', 'LineWidth', 0.8); hold on;
+plot(time_s, angle_pitch, 'g-', 'LineWidth', 0.8);
+plot(time_s, angle_yaw, 'b-', 'LineWidth', 0.8);
+ylabel('角度 (°)');
+legend('Roll', 'Pitch', 'Yaw', 'Location', 'best');
+title('姿态角度');
+grid on;
+
+subplot(4,1,2);
+plot(time_s, gyro_roll, 'r-', 'LineWidth', 0.8); hold on;
+plot(time_s, gyro_pitch, 'g-', 'LineWidth', 0.8);
+plot(time_s, gyro_yaw, 'b-', 'LineWidth', 0.8);
+ylabel('角速度 (°/s)');
+legend('Roll', 'Pitch', 'Yaw', 'Location', 'best');
+title('角速度');
+grid on;
+
+subplot(4,1,3);
+plot(time_s, delta_FR, 'LineWidth', 0.8); hold on;
+plot(time_s, delta_FL, 'LineWidth', 0.8);
+plot(time_s, delta_BL, 'LineWidth', 0.8);
+plot(time_s, delta_BR, 'LineWidth', 0.8);
+ylabel('舵面 (°)');
+legend('FR', 'FL', 'BL', 'BR', 'Location', 'best');
+title('舵面输出');
+grid on;
+
+subplot(4,1,4);
+plot(time_s, state, 'k-', 'LineWidth', 1);
+ylabel('状态机');
+xlabel('时间 (s)');
+title('状态机');
+grid on;
+
+%% 图2: 雅可比矩阵可视化
+figure('Name', '雅可比矩阵', 'Position', [100 100 900 400]);
+
+subplot(1,2,1);
+imagesc(J_sym);
 colorbar;
-colormap(bluewhitered(256));  % 蓝-白-红，零点为白色
-caxis([-max(abs(J_best(:))), max(abs(J_best(:)))]);
-set(gca, 'XTick', 1:4, 'XTickLabel', {'FR','FL','BL','BR'});
-set(gca, 'YTick', 1:3, 'YTickLabel', {'Roll','Pitch','Yaw'});
-title('雅可比矩阵 (红正蓝负)');
+set(gca, 'XTick', 1:4, 'XTickLabel', {'FR', 'FL', 'BL', 'BR'});
+set(gca, 'YTick', 1:3, 'YTickLabel', {'Roll', 'Pitch', 'Yaw'});
+title('雅可比矩阵 (原始)');
 for i = 1:3
     for j = 1:4
-        text(j, i, sprintf('%.4f', J_best(i,j)), ...
-            'HorizontalAlignment', 'center', 'FontWeight', 'bold');
+        text(j, i, sprintf('%.3f', J_sym(i,j)), ...
+            'HorizontalAlignment', 'center', 'Color', 'w', 'FontWeight', 'bold');
     end
 end
 
-% 物理解释图
-subplot(2,3,2);
-bar([J_best(1,:); J_best(2,:); J_best(3,:)]');
-set(gca, 'XTickLabel', {'FR','FL','BL','BR'});
-legend({'Roll', 'Pitch', 'Yaw'}, 'Location', 'best');
-ylabel('灵敏度 (deg/deg)');
-title('各舵面对各轴的贡献');
-grid on;
-
-% 拟合散点图 - Roll
-subplot(2,3,3);
-Y_pred = dX * J_best';
-scatter(dY_angle(:,1), Y_pred(:,1), 5, 'filled', 'MarkerFaceAlpha', 0.3);
-hold on;
-plot(xlim, xlim, 'r--', 'LineWidth', 2);
-xlabel('实际 Roll 变化 (deg)');
-ylabel('预测 Roll 变化 (deg)');
-title(sprintf('Roll 拟合 (R²=%.3f)', R2_con(1)));
-grid on;
-axis equal;
-
-% Pitch
-subplot(2,3,4);
-scatter(dY_angle(:,2), Y_pred(:,2), 5, 'filled', 'MarkerFaceAlpha', 0.3);
-hold on;
-plot(xlim, xlim, 'r--', 'LineWidth', 2);
-xlabel('实际 Pitch 变化 (deg)');
-ylabel('预测 Pitch 变化 (deg)');
-title(sprintf('Pitch 拟合 (R²=%.3f)', R2_con(2)));
-grid on;
-axis equal;
-
-% Yaw
-subplot(2,3,5);
-scatter(dY_angle(:,3), Y_pred(:,3), 5, 'filled', 'MarkerFaceAlpha', 0.3);
-hold on;
-plot(xlim, xlim, 'r--', 'LineWidth', 2);
-xlabel('实际 Yaw 变化 (deg)');
-ylabel('预测 Yaw 变化 (deg)');
-title(sprintf('Yaw 拟合 (R²=%.3f)', R2_con(3)));
-grid on;
-axis equal;
-
-% 残差分布
-subplot(2,3,6);
-residuals = dY_angle - Y_pred;
-histogram(residuals(:), 50, 'Normalization', 'pdf');
-xlabel('残差 (deg)');
-ylabel('概率密度');
-title('残差分布');
-grid on;
-
-sgtitle(sprintf('X型翼雅可比矩阵分析 (%d文件, %d点, 方法:%s)', ...
-    nFiles, size(X_all,1), method_name));
-
-%% 13. 保存结果
-result.J_best = J_best;
-result.J_unconstrained = J_unconstrained;
-result.J_constrained = J_constrained;
-result.theta = theta;
-result.R2 = R2_con;
-result.X_mean = X_mean;
-result.Y_mean = Y_angle_mean;
-result.nFiles = nFiles;
-result.nPoints = size(X_all, 1);
-
-save('xwing_jacobian.mat', 'result');
-fprintf('\n结果已保存至 xwing_jacobian.mat\n');
-
-%% =====================================================================
-%  辅助函数
-%% =====================================================================
-
-function printJacobian(J, name)
-    fprintf('\n[%s] 雅可比矩阵:\n', name);
-    fprintf('           FR        FL        BL        BR\n');
-    labels = {'Roll ', 'Pitch', 'Yaw  '};
-    for i = 1:3
-        fprintf('%s:  %+9.5f %+9.5f %+9.5f %+9.5f\n', labels{i}, J(i,:));
+subplot(1,2,2);
+imagesc(J_norm);
+colorbar;
+caxis([-1, 1]);
+set(gca, 'XTick', 1:4, 'XTickLabel', {'FR', 'FL', 'BL', 'BR'});
+set(gca, 'YTick', 1:3, 'YTickLabel', {'Roll', 'Pitch', 'Yaw'});
+title('归一化雅可比矩阵');
+for i = 1:3
+    for j = 1:4
+        text(j, i, sprintf('%.2f', J_norm(i,j)), ...
+            'HorizontalAlignment', 'center', 'Color', 'w', 'FontWeight', 'bold');
     end
 end
 
-function analyzeJacobian(J)
-    fprintf('\n物理合理性检查:\n');
-    
-    % Roll: FR和BR应该同号（右侧），FL和BL应该同号（左侧），左右反号
-    roll_right = J(1,1) + J(1,4);  % FR + BR
-    roll_left = J(1,2) + J(1,3);   % FL + BL
-    fprintf('  Roll: 右侧=%.4f, 左侧=%.4f (应反号)\n', roll_right, roll_left);
-    
-    % Pitch: 前翼(FR+FL)和后翼(BL+BR)应该反号
-    pitch_front = J(2,1) + J(2,2);
-    pitch_back = J(2,3) + J(2,4);
-    fprintf('  Pitch: 前翼=%.4f, 后翼=%.4f (应反号)\n', pitch_front, pitch_back);
-    
-    % Yaw: 对角应该同号 (FR,BL) vs (FL,BR)
-    yaw_diag1 = J(3,1) + J(3,3);   % FR + BL
-    yaw_diag2 = J(3,2) + J(3,4);   % FL + BR
-    fprintf('  Yaw: 对角1(FR+BL)=%.4f, 对角2(FL+BR)=%.4f (应反号)\n', yaw_diag1, yaw_diag2);
-end
+%% 图3: 频谱分析
+figure('Name', '频谱分析', 'Position', [150 150 1000 400]);
 
-function c = bluewhitered(n)
-    % 生成蓝-白-红颜色图
-    if nargin < 1
-        n = 256;
-    end
-    
-    half = floor(n/2);
-    
-    % 蓝到白
-    r1 = linspace(0, 1, half)';
-    g1 = linspace(0, 1, half)';
-    b1 = ones(half, 1);
-    
-    % 白到红
-    r2 = ones(n-half, 1);
-    g2 = linspace(1, 0, n-half)';
-    b2 = linspace(1, 0, n-half)';
-    
-    c = [r1 g1 b1; r2 g2 b2];
-end
+subplot(1,2,1);
+semilogy(f, P_roll, 'r-', 'LineWidth', 1);
+xlabel('频率 (Hz)');
+ylabel('幅值');
+title('Roll角速度频谱');
+xlim([0, min(20, Fs/2)]);
+grid on;
+
+subplot(1,2,2);
+semilogy(f, P_pitch, 'g-', 'LineWidth', 1);
+xlabel('频率 (Hz)');
+ylabel('幅值');
+title('Pitch角速度频谱');
+xlim([0, min(20, Fs/2)]);
+grid on;
+
+%% 图4: 轴间耦合散点图
+figure('Name', '轴间耦合', 'Position', [200 200 1200 400]);
+
+subplot(1,3,1);
+scatter(gyro_roll, gyro_pitch, 1, 'b');
+xlabel('Roll Rate (°/s)');
+ylabel('Pitch Rate (°/s)');
+title(sprintf('Roll-Pitch (r=%.2f)', corr_roll_pitch(1,2)));
+grid on;
+
+subplot(1,3,2);
+scatter(gyro_roll, gyro_yaw, 1, 'r');
+xlabel('Roll Rate (°/s)');
+ylabel('Yaw Rate (°/s)');
+title(sprintf('Roll-Yaw (r=%.2f)', corr_roll_yaw(1,2)));
+grid on;
+
+subplot(1,3,3);
+scatter(gyro_pitch, gyro_yaw, 1, 'g');
+xlabel('Pitch Rate (°/s)');
+ylabel('Yaw Rate (°/s)');
+title(sprintf('Pitch-Yaw (r=%.2f)', corr_pitch_yaw(1,2)));
+grid on;
+
+%% 生成C代码
+fprintf('\n===== 生成C代码 =====\n');
+fprintf('// 雅可比矩阵 (由MATLAB拟合生成)\n');
+fprintf('// 舵面顺序: [FR, FL, BL, BR]\n');
+fprintf('static const float Jacobian_Matrix[3][4] = {\n');
+fprintf('    {%+.6ff, %+.6ff, %+.6ff, %+.6ff},  // Roll\n', J_sym(1,:));
+fprintf('    {%+.6ff, %+.6ff, %+.6ff, %+.6ff},  // Pitch\n', J_sym(2,:));
+fprintf('    {%+.6ff, %+.6ff, %+.6ff, %+.6ff}   // Yaw\n', J_sym(3,:));
+fprintf('};\n');
+
+fprintf('\n===== 分析完成 =====\n');

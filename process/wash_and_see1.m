@@ -1,28 +1,26 @@
+
 %{
-对应提示词:
-
-编写一个 MATLAB 脚本用于分析具有循环录制特征的飞机黑匣子 CSV 数据
-
-任务描述：
-请编写一个 MATLAB 脚本，从本地选择一个 CSV 文件并进行数据清洗、预处理及可视化。
-
-1. 数据结构：
-CSV 文件包含 15 列，表头及顺序如下：
-packet_timestamp, statemachine, angle_roll, angle_pitch, angle_yaw, gyro_x, gyro_y, gyro_z, acc_x, acc_y, acc_z, rudder1, rudder2, rudder3, rudder4
-
-2. 解析逻辑：
-文件读取：使用 uigetfile 让用户手动选择路径，并使用 delimitedTextImportOptions 预定义变量类型。
-时间戳处理：packet_timestamp 是一个每 10ms 加 1 的数值计数器（不是标准日期格式），请将其设为 double 类型。
-循环录制清洗：黑匣子存在循环录制逻辑，数据可能乱序。必须先根据 timestamp 进行 全局升序排序 (sortrows)，然后剔除重复的时间戳 (unique)。
-时间归一化：将清洗后的计数器转换为从 0 开始的秒数（步长为 0.01s）。
-缺失值处理：对数值列使用线性插值 fillmissing 填充 NaN。
-3. 可视化要求：
-图1（姿态）：在一个图中绘制 Roll, Pitch, Yaw 随时间（秒）的变化曲线。
-图2（动力学）：使用 yyaxis，左轴显示三轴加速度（acc），右轴显示三轴角速度（gyro）。
-图3（执行器）：绘制四个舵机输出（rudder1-4）的曲线。
-4. 进阶分析（PID 优化基础）：
-计算 gyro_x 的一阶导数（角加速度），并将其与 rudder1 的输入绘制在同一个双 Y 轴图中，用于评估控制灵敏度（雅可比矩阵元素估计）。
-
+MATLAB 脚本：分析具有循环录制特征的飞机黑匣子 CSV 数据
+目标与任务：
+  - 从本地选择一个 CSV 文件，进行数据清洗、预处理及可视化
+数据结构：
+  - CSV 文件包含 15 列，字段顺序固定为：
+    packet_timestamp, statemachine, angle_roll, angle_pitch, angle_yaw, gyro_x, gyro_y, gyro_z, acc_x, acc_y, acc_z, rudder1, rudder2, rudder3, rudder4
+解析逻辑：
+  - 文件读取：通过 uigetfile 让用户手动选择路径；使用 delimitedTextImportOptions 预定义变量类型
+  - 时间戳处理：packet_timestamp 为一个每 10 ms 加 1 的数值计数器（不是日期格式），应设为 double
+  - 循环录制清洗：黑匣子存在循环录制，数据可能乱序。需先按 timestamp 全局升序排序 (sortrows)，再剔除重复时间戳 (unique)
+  - 时间归一化：将清洗后的计数器转换为从 0 开始的秒数，步长为 0.01 s
+  - 缺失值处理：对数值列使用线性插值 fillmissing 填充 NaN
+可视化要求：
+  - 图1（姿态）：在同一图中绘制 Roll、Pitch、Yaw 随时间（秒）的变化曲线
+  - 图2（动力学）：使用 yyaxis，左轴显示三轴加速度（acc_x, acc_y, acc_z），右轴显示三轴角速度（gyro_x, gyro_y, gyro_z）
+  - 图3（执行器）：绘制四个舵机输出（rudder1-4）的曲线
+进阶分析（PID 优化基础）：
+  - 计算 gyro_x 的一阶导数（角加速度），并将其与 rudder1 的输入绘制在同一个双 Y 轴图中，用于评估控制灵敏度（雅可比矩阵元素估计）
+运行提示：
+  - 需要 MATLAB 版本支持 delimitedTextImportOptions（R2019b 及以上）
+  - 代码应对缺失数据、时间对齐、单位一致性等进行健壮处理
 %}
 
 %% 1. 文件选择与数据加载
